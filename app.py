@@ -1,300 +1,575 @@
-import base64
-import csv
-import io
-import re
-from datetime import datetime, timezone
-
-import pandas as pd
-import requests
 import streamlit as st
+import pandas as pd
+from datetime import date
+from urllib.parse import urlencode
+from io import BytesIO
+import qrcode
 
-st.set_page_config(page_title="Seminar Attendance", page_icon="✅", layout="centered")
+from github_storage import (
+    github_configured,
+    append_attendance,
+    read_attendance,
+    list_attendance_files,
+)
 
-OWNER = st.secrets.get("GITHUB_OWNER", "")
-REPO = st.secrets.get("GITHUB_REPO", "")
-BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
-TOKEN = st.secrets.get("GITHUB_TOKEN", "")
-ATTENDANCE_DIR = st.secrets.get("ATTENDANCE_DIR", "attendance")
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+# ---------------------------------------------------------
+# PAGE CONFIG
+# ---------------------------------------------------------
 
-REQUIRED_COLUMNS = [
-    "attendance_id", "timestamp_utc", "seminar_date", "college",
-    "student_name", "mobile", "email", "department", "year", "roll_no"
-]
+st.set_page_config(
+    page_title="Seminar Attendance",
+    page_icon="🎓",
+    layout="centered",
+)
 
+# ---------------------------------------------------------
+# CUSTOM CSS
+# ---------------------------------------------------------
 
-def config_ok():
-    return bool(OWNER and REPO and TOKEN)
-
-
-def gh_headers():
-    return {
-        "Authorization": f"Bearer {TOKEN}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
+st.markdown(
+    """
+    <style>
+    .main-title {
+        font-size: 34px;
+        font-weight: 700;
+        margin-bottom: 0;
     }
 
+    .company-name {
+        font-size: 18px;
+        color: #555;
+        margin-bottom: 25px;
+    }
 
-def safe_filename(value: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
-    return value.strip("._") or "unknown"
+    .success-box {
+        padding: 15px;
+        border-radius: 10px;
+        background-color: #e8f5e9;
+        border: 1px solid #81c784;
+    }
 
+    .info-box {
+        padding: 15px;
+        border-radius: 10px;
+        background-color: #e3f2fd;
+        border: 1px solid #64b5f6;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def attendance_filename(seminar_date: str, college: str) -> str:
-    return f"{safe_filename(seminar_date)}_{safe_filename(college)}.csv"
+# ---------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------
 
+st.markdown(
+    '<div class="main-title">🎓 Seminar Attendance</div>',
+    unsafe_allow_html=True,
+)
 
-def repo_path(seminar_date: str, college: str) -> str:
-    return f"{ATTENDANCE_DIR.strip('/')}/{attendance_filename(seminar_date, college)}"
-
-
-def github_get_file(path: str):
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{path}"
-    r = requests.get(url, headers=gh_headers(), params={"ref": BRANCH}, timeout=20)
-    if r.status_code == 404:
-        return None, None
-    r.raise_for_status()
-    data = r.json()
-    content = base64.b64decode(data["content"]).decode("utf-8")
-    return content, data["sha"]
-
-
-def github_put_file(path: str, content: str, sha: str | None, message: str):
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{path}"
-    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    payload = {"message": message, "content": encoded, "branch": BRANCH}
-    if sha:
-        payload["sha"] = sha
-    r = requests.put(url, headers=gh_headers(), json=payload, timeout=30)
-    if r.status_code == 409:
-        raise RuntimeError("The attendance file changed at the same time. Please submit again.")
-    r.raise_for_status()
-    return r.json()
-
-
-def parse_csv(content: str) -> list[dict]:
-    if not content.strip():
-        return []
-    return list(csv.DictReader(io.StringIO(content)))
+st.markdown(
+    '<div class="company-name">Niyature Technologies</div>',
+    unsafe_allow_html=True,
+)
 
 
-def build_csv(rows: list[dict]) -> str:
-    output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=REQUIRED_COLUMNS, lineterminator="\n")
-    writer.writeheader()
-    writer.writerows(rows)
-    return output.getvalue()
+# ---------------------------------------------------------
+# GITHUB CONFIG CHECK
+# ---------------------------------------------------------
 
+if not github_configured():
+    st.error(
+        """
+        GitHub storage is not configured.
 
-def normalize_mobile(value: str) -> str:
-    digits = re.sub(r"\D", "", value or "")
-    if digits.startswith("91") and len(digits) == 12:
-        digits = digits[-10:]
-    return digits
+        Please configure the following values in Streamlit Cloud:
 
-
-def append_attendance(seminar_date: str, college: str, rows: list[dict]):
-    path = repo_path(seminar_date, college)
-    content, sha = github_get_file(path)
-    existing = parse_csv(content or "")
-    existing_mobiles = {normalize_mobile(r.get("mobile", "")) for r in existing}
-
-    new_rows = []
-    duplicate_rows = []
-    for row in rows:
-        mobile = normalize_mobile(row["mobile"])
-        if mobile in existing_mobiles or any(normalize_mobile(x["mobile"]) == mobile for x in new_rows):
-            duplicate_rows.append(row)
-            continue
-        row["mobile"] = mobile
-        new_rows.append(row)
-        existing_mobiles.add(mobile)
-
-    if not new_rows:
-        return 0, len(duplicate_rows), path
-
-    updated = existing + new_rows
-    github_put_file(
-        path,
-        build_csv(updated),
-        sha,
-        f"Add seminar attendance - {seminar_date} - {college}",
+        - GITHUB_OWNER
+        - GITHUB_REPO
+        - GITHUB_BRANCH
+        - GITHUB_TOKEN
+        - ATTENDANCE_DIR
+        - ADMIN_PASSWORD
+        """
     )
-    return len(new_rows), len(duplicate_rows), path
-
-
-def list_attendance_files():
-    url = f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{ATTENDANCE_DIR.strip('/')}"
-    r = requests.get(url, headers=gh_headers(), params={"ref": BRANCH}, timeout=20)
-    if r.status_code == 404:
-        return []
-    r.raise_for_status()
-    return [x for x in r.json() if x.get("type") == "file" and x.get("name", "").endswith(".csv")]
-
-
-def read_attendance_file(download_url: str):
-    r = requests.get(download_url, headers=gh_headers(), timeout=20)
-    r.raise_for_status()
-    return r.text
-
-
-def query_value(name, default=""):
-    try:
-        return st.query_params.get(name, default)
-    except Exception:
-        return default
-
-
-st.markdown("<h1 style='text-align:center'>Seminar Attendance</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;color:#666'>Niyature Technologies</p>", unsafe_allow_html=True)
-
-if not config_ok():
-    st.error("GitHub storage is not configured. Add the required Streamlit secrets before using the app.")
-    st.code("GITHUB_OWNER = \"your-github-username\"\nGITHUB_REPO = \"seminar-attendance\"\nGITHUB_BRANCH = \"main\"\nGITHUB_TOKEN = \"your-token\"\nATTENDANCE_DIR = \"attendance\"\nADMIN_PASSWORD = \"your-admin-password\"")
     st.stop()
 
-# Admin page
-if query_value("admin") == "1":
-    if not st.session_state.get("admin_logged_in", False):
-        st.subheader("Admin Login")
-        password = st.text_input("Admin password", type="password")
-        if st.button("Login", type="primary", use_container_width=True):
-            if ADMIN_PASSWORD and password == ADMIN_PASSWORD:
-                st.session_state.admin_logged_in = True
-                st.rerun()
-            st.error("Invalid password.")
+
+# ---------------------------------------------------------
+# URL PARAMETERS
+# ---------------------------------------------------------
+
+params = st.query_params
+
+seminar = params.get("seminar", "")
+seminar_date = params.get("date", "")
+college = params.get("college", "")
+admin_mode = params.get("admin", "")
+
+
+# ---------------------------------------------------------
+# VALIDATE SEMINAR URL
+# ---------------------------------------------------------
+
+if not admin_mode:
+
+    if not seminar or not seminar_date or not college:
+        st.warning(
+            """
+            The organizer has not provided a valid seminar attendance link.
+            """
+        )
+
+        st.info(
+            """
+            A valid seminar link must contain:
+
+            `seminar`
+
+            `date`
+
+            `college`
+            """
+        )
+
+        st.code(
+            "https://YOUR-APP.streamlit.app/"
+            "?seminar=Big%20Data%20AI"
+            "&date=2026-10-05"
+            "&college=ABC%20College"
+        )
+
         st.stop()
 
-    st.success("Admin dashboard")
-    if st.button("Logout"):
-        st.session_state.admin_logged_in = False
-        st.rerun()
 
-    st.subheader("Attendance files")
-    files = list_attendance_files()
-    if not files:
-        st.info("No attendance CSV files have been created yet.")
-    else:
-        for item in files:
-            st.markdown(f"**{item['name']}**")
-            content = read_attendance_file(item["download_url"])
-            df = pd.read_csv(io.StringIO(content))
-            st.write(f"Records: {len(df)}")
+# ---------------------------------------------------------
+# ADMIN MODE
+# ---------------------------------------------------------
+
+if admin_mode == "1":
+
+    st.header("🔐 Organizer / Admin")
+
+    password = st.text_input(
+        "Admin Password",
+        type="password",
+    )
+
+    admin_password = st.secrets.get(
+        "ADMIN_PASSWORD",
+        "",
+    )
+
+    if not password:
+        st.info("Enter the admin password.")
+        st.stop()
+
+    if password != admin_password:
+        st.error("Invalid admin password.")
+        st.stop()
+
+    st.success("Admin access granted.")
+
+    st.divider()
+
+    # -----------------------------------------------------
+    # CREATE SEMINAR LINK
+    # -----------------------------------------------------
+
+    st.subheader("Create Seminar Attendance Link")
+
+    seminar_name = st.text_input(
+        "Seminar Name",
+        placeholder="Big Data Analytics",
+    )
+
+    college_name = st.text_input(
+        "College Name",
+        placeholder="ABC College of Engineering",
+    )
+
+    seminar_dt = st.date_input(
+        "Seminar Date",
+        value=date.today(),
+    )
+
+    if st.button(
+        "Generate Attendance Link",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        if not seminar_name.strip():
+            st.error("Please enter seminar name.")
+            st.stop()
+
+        if not college_name.strip():
+            st.error("Please enter college name.")
+            st.stop()
+
+        query = urlencode(
+            {
+                "seminar": seminar_name.strip(),
+                "date": seminar_dt.isoformat(),
+                "college": college_name.strip(),
+            }
+        )
+
+        # APP_URL should be configured in Streamlit Secrets.
+        app_url = st.secrets.get(
+            "APP_URL",
+            "",
+        ).strip()
+
+        if not app_url:
+            st.warning(
+                """
+                APP_URL is not configured in Streamlit Secrets.
+
+                Enter your Streamlit application URL below.
+                """
+            )
+
+            app_url = st.text_input(
+                "Streamlit App URL",
+                placeholder="https://your-app.streamlit.app",
+            ).strip().rstrip("/")
+
+        if app_url:
+
+            attendance_url = f"{app_url}/?{query}"
+
+            st.success("Attendance link generated.")
+
+            st.text_input(
+                "Student Attendance URL",
+                value=attendance_url,
+            )
+
+            st.markdown("### QR Code")
+
+            qr = qrcode.make(attendance_url)
+
+            buffer = BytesIO()
+            qr.save(buffer, format="PNG")
+
+            st.image(
+                buffer.getvalue(),
+                caption="Scan to mark attendance",
+                width=300,
+            )
+
             st.download_button(
-                "Download CSV",
-                data=content.encode("utf-8"),
-                file_name=item["name"],
-                mime="text/csv",
-                key=f"download_{item['name']}",
+                label="Download QR Code",
+                data=buffer.getvalue(),
+                file_name="seminar_attendance_qr.png",
+                mime="image/png",
                 use_container_width=True,
             )
-            with st.expander("Preview"):
-                st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # -----------------------------------------------------
+    # VIEW ATTENDANCE FILES
+    # -----------------------------------------------------
+
+    st.divider()
+
+    st.subheader("📊 Attendance Records")
+
+    try:
+
+        files = list_attendance_files()
+
+        if not files:
+            st.info("No attendance files found yet.")
+
+        else:
+
+            selected_file = st.selectbox(
+                "Select Attendance File",
+                files,
+            )
+
+            if selected_file:
+
+                df = read_attendance(
+                    selected_file
+                )
+
+                if df is not None and not df.empty:
+
+                    st.write(
+                        f"Total Attendance: **{len(df)}**"
+                    )
+
+                    st.dataframe(
+                        df,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    csv_data = df.to_csv(
+                        index=False
+                    ).encode("utf-8")
+
+                    st.download_button(
+                        "Download CSV",
+                        data=csv_data,
+                        file_name=selected_file.split("/")[-1],
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+
+                else:
+                    st.warning(
+                        "Attendance file is empty."
+                    )
+
+    except Exception as e:
+
+        st.error(
+            f"Unable to load attendance records: {e}"
+        )
+
     st.stop()
 
-# Seminar parameters are intentionally explicit in the public URL.
-seminar_date = query_value("date")
-college = query_value("college")
-seminar_name = query_value("seminar", "Seminar Attendance")
 
-if not seminar_date or not college:
-    st.info("The organizer has not provided a valid seminar attendance link.")
-    st.markdown("Example public link:")
-    st.code("https://YOUR-APP.streamlit.app/?seminar=Big%20Data%20AI&date=2026-10-05&college=ABC%20College")
-    st.stop()
+# ---------------------------------------------------------
+# STUDENT ATTENDANCE PAGE
+# ---------------------------------------------------------
 
-try:
-    datetime.strptime(seminar_date, "%Y-%m-%d")
-except ValueError:
-    st.error("Invalid seminar date. Use YYYY-MM-DD.")
-    st.stop()
+st.header(seminar)
 
-st.subheader(seminar_name)
-st.caption(f"Date: {seminar_date}  |  College: {college}")
-st.info(f"Attendance will be stored in: {attendance_filename(seminar_date, college)}")
+st.markdown(
+    f"""
+    **College:** {college}
 
-if "rows" not in st.session_state:
-    st.session_state.rows = 1
-
-st.markdown("### Mark attendance")
-st.caption("A coordinator can enter multiple students from one device. Duplicate mobile numbers are rejected for this seminar/date/college file.")
-
-for i in range(st.session_state.rows):
-    with st.container(border=True):
-        st.markdown(f"**Student {i + 1}**")
-        c1, c2 = st.columns(2)
-        c1.text_input("Full name *", key=f"name_{i}")
-        c2.text_input("Mobile number *", key=f"mobile_{i}", max_chars=15)
-        c3, c4 = st.columns(2)
-        c3.text_input("Email", key=f"email_{i}")
-        c4.text_input("Department", key=f"department_{i}")
-        c5, c6, c7 = st.columns(3)
-        c5.selectbox("Year", ["", "1st", "2nd", "3rd", "4th", "Other"], key=f"year_{i}")
-        c6.text_input("Roll number", key=f"roll_{i}")
-        c7.text_input("College", value=college, disabled=True, key=f"college_display_{i}")
-
-c1, c2 = st.columns(2)
-if c1.button("＋ Add another student", use_container_width=True):
-    if st.session_state.rows < 50:
-        st.session_state.rows += 1
-        st.rerun()
-
-if c2.button("Submit attendance", type="primary", use_container_width=True):
-    rows = []
-    errors = []
-    seen = set()
-    timestamp = datetime.now(timezone.utc).isoformat()
-
-    for i in range(st.session_state.rows):
-        name = st.session_state.get(f"name_{i}", "").strip()
-        mobile = normalize_mobile(st.session_state.get(f"mobile_{i}", ""))
-        email = st.session_state.get(f"email_{i}", "").strip()
-        department = st.session_state.get(f"department_{i}", "").strip()
-        year = st.session_state.get(f"year_{i}", "")
-        roll_no = st.session_state.get(f"roll_{i}", "").strip()
-
-        if not name or not mobile:
-            errors.append(f"Student {i + 1}: name and mobile are required.")
-            continue
-        if len(mobile) != 10 or not mobile.isdigit():
-            errors.append(f"Student {i + 1}: enter a valid 10-digit mobile number.")
-            continue
-        if mobile in seen:
-            errors.append(f"Student {i + 1}: duplicate mobile number in this submission.")
-            continue
-        seen.add(mobile)
-        rows.append({
-            "attendance_id": f"ATT-{datetime.now().strftime('%Y%m%d%H%M%S')}-{i+1:02d}",
-            "timestamp_utc": timestamp,
-            "seminar_date": seminar_date,
-            "college": college,
-            "student_name": name,
-            "mobile": mobile,
-            "email": email,
-            "department": department,
-            "year": year,
-            "roll_no": roll_no,
-        })
-
-    for error in errors:
-        st.error(error)
-
-    if rows:
-        try:
-            added, duplicates, path = append_attendance(seminar_date, college, rows)
-            if added:
-                st.success(f"Attendance successfully marked for {added} student(s).")
-                st.caption(f"Stored in GitHub: {path}")
-            if duplicates:
-                st.warning(f"{duplicates} student(s) were skipped because attendance already exists.")
-            if added:
-                st.session_state.rows = 1
-                for key in list(st.session_state.keys()):
-                    if re.match(r"^(name|mobile|email|department|year|roll_no)_\d+$", key):
-                        del st.session_state[key]
-                st.rerun()
-        except Exception as e:
-            st.error(f"Could not save attendance: {e}")
+    **Seminar Date:** {seminar_date}
+    """
+)
 
 st.divider()
-st.caption("Please verify student details before submitting. Attendance is stored as a CSV file in the configured GitHub repository.")
+
+# ---------------------------------------------------------
+# ATTENDANCE FORM
+# ---------------------------------------------------------
+
+st.subheader("Mark Attendance")
+
+st.write(
+    "You can enter multiple students from the same device."
+)
+
+MAX_STUDENTS = 20
+
+with st.form("attendance_form"):
+
+    number_of_students = st.number_input(
+        "Number of Students",
+        min_value=1,
+        max_value=MAX_STUDENTS,
+        value=1,
+        step=1,
+    )
+
+    student_entries = []
+
+    for i in range(int(number_of_students)):
+
+        st.markdown(
+            f"**Student {i + 1}**"
+        )
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            student_name = st.text_input(
+                "Student Name",
+                key=f"name_{i}",
+                placeholder="Full Name",
+            )
+
+        with col2:
+
+            enrollment_number = st.text_input(
+                "Enrollment / Roll Number",
+                key=f"roll_{i}",
+                placeholder="Roll Number",
+            )
+
+        student_entries.append(
+            {
+                "student_name": student_name.strip(),
+                "enrollment_number": enrollment_number.strip(),
+            }
+        )
+
+    submitted = st.form_submit_button(
+        "Submit Attendance",
+        type="primary",
+        use_container_width=True,
+    )
+
+
+# ---------------------------------------------------------
+# PROCESS ATTENDANCE
+# ---------------------------------------------------------
+
+if submitted:
+
+    valid_students = []
+
+    for student in student_entries:
+
+        if (
+            student["student_name"]
+            and student["enrollment_number"]
+        ):
+            valid_students.append(student)
+
+    if not valid_students:
+
+        st.error(
+            "Please enter at least one student's details."
+        )
+
+        st.stop()
+
+    # ---------------------------------------------
+    # Check duplicate roll numbers inside submission
+    # ---------------------------------------------
+
+    roll_numbers = [
+        x["enrollment_number"].lower()
+        for x in valid_students
+    ]
+
+    duplicate_rolls = {
+        x for x in roll_numbers
+        if roll_numbers.count(x) > 1
+    }
+
+    if duplicate_rolls:
+
+        st.error(
+            "Duplicate enrollment / roll number found in this submission."
+        )
+
+        st.write(
+            ", ".join(duplicate_rolls)
+        )
+
+        st.stop()
+
+    # ---------------------------------------------
+    # Prepare seminar identifier
+    # ---------------------------------------------
+
+    seminar_info = {
+        "seminar": seminar,
+        "date": seminar_date,
+        "college": college,
+    }
+
+    # ---------------------------------------------
+    # Save each student
+    # ---------------------------------------------
+
+    successful = []
+    duplicate = []
+    failed = []
+
+    for student in valid_students:
+
+        result = append_attendance(
+            seminar_info=seminar_info,
+            student_name=student["student_name"],
+            enrollment_number=student["enrollment_number"],
+        )
+
+        if result["status"] == "success":
+
+            successful.append(student)
+
+        elif result["status"] == "duplicate":
+
+            duplicate.append(student)
+
+        else:
+
+            failed.append(
+                {
+                    **student,
+                    "error": result.get(
+                        "message",
+                        "Unknown error",
+                    ),
+                }
+            )
+
+    # ---------------------------------------------
+    # Results
+    # ---------------------------------------------
+
+    if successful:
+
+        st.success(
+            f"Attendance successfully recorded for "
+            f"{len(successful)} student(s)."
+        )
+
+    if duplicate:
+
+        st.warning(
+            f"{len(duplicate)} student(s) were already marked present."
+        )
+
+        with st.expander(
+            "View duplicate students"
+        ):
+
+            for student in duplicate:
+
+                st.write(
+                    f"• {student['student_name']} "
+                    f"({student['enrollment_number']})"
+                )
+
+    if failed:
+
+        st.error(
+            f"{len(failed)} student(s) could not be recorded."
+        )
+
+        with st.expander(
+            "View failed records"
+        ):
+
+            for student in failed:
+
+                st.write(
+                    f"• {student['student_name']} "
+                    f"({student['enrollment_number']})"
+                )
+
+                st.caption(
+                    student["error"]
+                )
+
+    if successful:
+
+        st.balloons()
+
+        st.markdown(
+            """
+            <div class="success-box">
+
+            ### ✅ Attendance Submitted
+
+            Thank you for attending the seminar.
+
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
